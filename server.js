@@ -184,13 +184,13 @@ function getYousignTitle(event, yousignId) {
 function extractStudyReferenceFromTitle(title) {
   if (!title) return null;
 
-  const lastDashIndex = title.lastIndexOf("-");
+  const match = title.trim().match(/^(.+_\d+(?:\.\d+)?_\d{4})-.+$/);
 
-  if (lastDashIndex <= 0) {
+  if (!match) {
     return null;
   }
 
-  return title.slice(0, lastDashIndex).trim();
+  return match[1].trim();
 }
 
 async function findStudyPageByReference(studyReference) {
