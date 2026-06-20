@@ -11,6 +11,7 @@ const notion = new Client({
 });
 
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const NOTION_STUDIES_DATABASE_ID = process.env.NOTION_STUDIES_DATABASE_ID;
 
 const ROLES = [
   {
@@ -35,12 +36,20 @@ const ROLES = [
   },
 ];
 
-async function getDataSourceId() {
+async function getDataSourceId(databaseId) {
   const database = await notion.databases.retrieve({
-    database_id: NOTION_DATABASE_ID,
+    database_id: databaseId,
   });
 
   return database.data_sources[0].id;
+}
+
+async function getYousignDataSourceId() {
+  return await getDataSourceId(NOTION_DATABASE_ID);
+}
+
+async function getStudiesDataSourceId() {
+  return await getDataSourceId(NOTION_STUDIES_DATABASE_ID);
 }
 
 function textProperty(content) {
@@ -68,6 +77,16 @@ function dateProperty(date) {
     date: {
       start: date,
     },
+  };
+}
+
+function relationProperty(pageId) {
+  return {
+    relation: [
+      {
+        id: pageId,
+      },
+    ],
   };
 }
 
@@ -160,6 +179,55 @@ function getYousignTitle(event, yousignId) {
     signatureRequest.external_id ||
     `Demande Yousign ${String(yousignId).slice(0, 8)}`
   );
+}
+
+function extractStudyReferenceFromTitle(title) {
+  if (!title) return null;
+
+  const lastDashIndex = title.lastIndexOf("-");
+
+  if (lastDashIndex <= 0) {
+    return null;
+  }
+
+  return title.slice(0, lastDashIndex).trim();
+}
+
+async function findStudyPageByReference(studyReference) {
+  if (!studyReference) return null;
+
+  const dataSourceId = await getStudiesDataSourceId();
+
+  const response = await notion.dataSources.query({
+    data_source_id: dataSourceId,
+    filter: {
+      property: "Référence",
+      title: {
+        equals: studyReference,
+      },
+    },
+  });
+
+  return response.results[0] || null;
+}
+
+async function findStudyForYousignEvent(event, yousignId) {
+  const title = getYousignTitle(event, yousignId);
+  const studyReference = extractStudyReferenceFromTitle(title);
+
+  if (!studyReference) {
+    return {
+      studyReference: null,
+      studyPage: null,
+    };
+  }
+
+  const studyPage = await findStudyPageByReference(studyReference);
+
+  return {
+    studyReference,
+    studyPage,
+  };
 }
 
 function normalizeDate(value) {
@@ -263,7 +331,7 @@ function findRoleIndexBySignerIdInEvent(event, signerId) {
 }
 
 async function findNotionPageByYousignId(yousignId) {
-  const dataSourceId = await getDataSourceId();
+  const dataSourceId = await getYousignDataSourceId();
 
   const response = await notion.dataSources.query({
     data_source_id: dataSourceId,
@@ -278,13 +346,18 @@ async function findNotionPageByYousignId(yousignId) {
   return response.results[0];
 }
 
-async function createNotionPageFromYousign(event, status, withSignatureDate = false) {
-  const dataSourceId = await getDataSourceId();
+async function createNotionPageFromYousign(
+  event,
+  status,
+  studyPage,
+  withSignatureDate = false
+) {
+  const dataSourceId = await getYousignDataSourceId();
   const yousignId = getRequestId(event);
   const title = getYousignTitle(event, yousignId);
 
   const properties = {
-    Nom: {
+    "Nom": {
       title: [
         {
           text: {
@@ -295,6 +368,7 @@ async function createNotionPageFromYousign(event, status, withSignatureDate = fa
     },
     "Yousign ID": textProperty(yousignId),
     "Statut signataire": selectProperty(status),
+    "Études": relationProperty(studyPage.id),
     ...buildInitialSignerProperties(
       event,
       status === "Signé" ? "Signé" : "En attente",
@@ -314,7 +388,12 @@ async function createNotionPageFromYousign(event, status, withSignatureDate = fa
   });
 }
 
-async function updateGlobalStatus(pageId, status, withSignatureDate = false, event = null) {
+async function updateGlobalStatus(
+  pageId,
+  status,
+  withSignatureDate = false,
+  event = null
+) {
   const properties = {
     "Statut signataire": selectProperty(status),
     ...buildSignerIdUpdateProperties(event || {}),
@@ -362,6 +441,32 @@ async function updateSignerStatus(page, event) {
   return role.statusColumn;
 }
 
+async function createPageOnlyIfStudyExists(event, status, withSignatureDate = false) {
+  const yousignId = getRequestId(event);
+  const { studyReference, studyPage } = await findStudyForYousignEvent(
+    event,
+    yousignId
+  );
+
+  if (!studyReference || !studyPage) {
+    console.log(
+      `Demande ignorée : aucune étude trouvée pour "${getYousignTitle(
+        event,
+        yousignId
+      )}".`
+    );
+
+    return null;
+  }
+
+  return await createNotionPageFromYousign(
+    event,
+    status,
+    studyPage,
+    withSignatureDate
+  );
+}
+
 app.get("/", (req, res) => {
   res.send("Connecteur Yousign → Notion actif.");
 });
@@ -402,6 +507,21 @@ app.post("/webhook/yousign", async (req, res) => {
     }
 
     if (eventName === "signature_request.activated") {
+      const { studyReference, studyPage } = await findStudyForYousignEvent(
+        event,
+        yousignId
+      );
+
+      if (!studyReference || !studyPage) {
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+          message:
+            "Demande ignorée : le nom ne correspond à aucune étude existante.",
+          yousignId,
+        });
+      }
+
       const existingPage = await findNotionPageByYousignId(yousignId);
 
       if (existingPage) {
@@ -409,22 +529,23 @@ app.post("/webhook/yousign", async (req, res) => {
           page_id: existingPage.id,
           properties: {
             "Statut signataire": selectProperty("En cours"),
+            "Études": relationProperty(studyPage.id),
             ...buildSignerIdUpdateProperties(event),
           },
         });
 
         return res.status(200).json({
           success: true,
-          message: "Ligne Notion déjà existante, IDs signataires enregistrés",
+          message: "Ligne Notion déjà existante, étude et IDs enregistrés",
           yousignId,
         });
       }
 
-      await createNotionPageFromYousign(event, "En cours", false);
+      await createNotionPageFromYousign(event, "En cours", studyPage, false);
 
       return res.status(200).json({
         success: true,
-        message: "Ligne Notion créée avec IDs signataires",
+        message: "Ligne Notion créée avec relation Études",
         yousignId,
       });
     }
@@ -433,7 +554,20 @@ app.post("/webhook/yousign", async (req, res) => {
       let existingPage = await findNotionPageByYousignId(yousignId);
 
       if (!existingPage) {
-        existingPage = await createNotionPageFromYousign(event, "En cours", false);
+        existingPage = await createPageOnlyIfStudyExists(
+          event,
+          "En cours",
+          false
+        );
+      }
+
+      if (!existingPage) {
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+          message: "Demande ignorée : aucune étude correspondante.",
+          yousignId,
+        });
       }
 
       const updatedRole = await updateSignerStatus(existingPage, event);
@@ -454,23 +588,26 @@ app.post("/webhook/yousign", async (req, res) => {
     }
 
     if (eventName === "signature_request.done") {
-      const existingPage = await findNotionPageByYousignId(yousignId);
+      let existingPage = await findNotionPageByYousignId(yousignId);
 
-      if (existingPage) {
-        await updateGlobalStatus(existingPage.id, "Signé", true, event);
+      if (!existingPage) {
+        existingPage = await createPageOnlyIfStudyExists(event, "Signé", true);
+      }
 
+      if (!existingPage) {
         return res.status(200).json({
           success: true,
-          message: "Statut global Notion mis à jour en Signé",
+          ignored: true,
+          message: "Demande ignorée : aucune étude correspondante.",
           yousignId,
         });
       }
 
-      await createNotionPageFromYousign(event, "Signé", true);
+      await updateGlobalStatus(existingPage.id, "Signé", true, event);
 
       return res.status(200).json({
         success: true,
-        message: "Ligne Notion créée directement en Signé",
+        message: "Statut global Notion mis à jour en Signé",
         yousignId,
       });
     }
