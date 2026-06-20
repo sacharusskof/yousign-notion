@@ -16,18 +16,22 @@ const ROLES = [
   {
     statusColumn: "Respo P&Q",
     dateColumn: "Date signature Respo P&Q",
+    idColumn: "ID Respo P&Q",
   },
   {
     statusColumn: "Présidente",
     dateColumn: "Date signature Présidente",
+    idColumn: "ID Présidente",
   },
   {
     statusColumn: "Client 1",
     dateColumn: "Date signature Client 1",
+    idColumn: "ID Client 1",
   },
   {
     statusColumn: "Client 2",
     dateColumn: "Date signature Client 2",
+    idColumn: "ID Client 2",
   },
 ];
 
@@ -44,7 +48,7 @@ function textProperty(content) {
     rich_text: [
       {
         text: {
-          content,
+          content: content || "",
         },
       },
     ],
@@ -79,15 +83,54 @@ function getSigner(event) {
   return event.data?.signer || event.signer || {};
 }
 
+function getCurrentSignerId(event) {
+  const signer = getSigner(event);
+
+  return signer.id || event.data?.signer_id || event.signer_id || null;
+}
+
 function getSigners(event) {
   const signatureRequest = getSignatureRequest(event);
 
-  return (
-    signatureRequest.signers ||
-    event.data?.signers ||
-    event.signers ||
-    []
-  );
+  return signatureRequest.signers || event.data?.signers || event.signers || [];
+}
+
+function getSignerStageValue(signer) {
+  const value =
+    signer.recipient_stage_index ??
+    signer.recipientStageIndex ??
+    signer.stage_index ??
+    signer.order ??
+    signer.position;
+
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const numberValue = Number(value);
+
+  if (Number.isNaN(numberValue)) {
+    return null;
+  }
+
+  return numberValue;
+}
+
+function getOrderedSigners(event) {
+  return getSigners(event)
+    .map((signer, originalIndex) => ({
+      signer,
+      originalIndex,
+      stageIndex: getSignerStageValue(signer) || originalIndex + 1,
+    }))
+    .sort((a, b) => {
+      if (a.stageIndex !== b.stageIndex) {
+        return a.stageIndex - b.stageIndex;
+      }
+
+      return a.originalIndex - b.originalIndex;
+    })
+    .map((item) => item.signer);
 }
 
 function getRequestId(event) {
@@ -165,27 +208,9 @@ function getTextFromPage(page, propertyName) {
   return "";
 }
 
-function getSignerStageIndex(event) {
-  const signer = getSigner(event);
-
-  const value =
-    signer.recipient_stage_index ??
-    signer.recipientStageIndex ??
-    signer.stage_index ??
-    signer.order ??
-    signer.position ??
-    event.data?.recipient_stage_index;
-
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  return Number(value);
-}
-
 function buildInitialSignerProperties(event, status, withDates = false) {
-  const signers = getSigners(event);
-  const signerCount = signers.length || 3;
+  const orderedSigners = getOrderedSigners(event);
+  const signerCount = orderedSigners.length || 3;
   const signedAt = getSignatureDate(event);
 
   const properties = {};
@@ -193,16 +218,48 @@ function buildInitialSignerProperties(event, status, withDates = false) {
   ROLES.forEach((role, index) => {
     if (index < signerCount) {
       properties[role.statusColumn] = selectProperty(status);
+      properties[role.idColumn] = textProperty(orderedSigners[index]?.id || "");
 
       if (withDates) {
         properties[role.dateColumn] = dateProperty(signedAt);
       }
     } else {
       properties[role.statusColumn] = selectProperty("Non concerné");
+      properties[role.idColumn] = textProperty("");
     }
   });
 
   return properties;
+}
+
+function buildSignerIdUpdateProperties(event) {
+  const orderedSigners = getOrderedSigners(event);
+  const properties = {};
+
+  ROLES.forEach((role, index) => {
+    if (orderedSigners[index]?.id) {
+      properties[role.idColumn] = textProperty(orderedSigners[index].id);
+    }
+  });
+
+  return properties;
+}
+
+function findRoleIndexBySignerIdInPage(page, signerId) {
+  if (!signerId) return -1;
+
+  return ROLES.findIndex((role) => {
+    const storedSignerId = getTextFromPage(page, role.idColumn);
+    return storedSignerId === signerId;
+  });
+}
+
+function findRoleIndexBySignerIdInEvent(event, signerId) {
+  if (!signerId) return -1;
+
+  const orderedSigners = getOrderedSigners(event);
+
+  return orderedSigners.findIndex((signer) => signer.id === signerId);
 }
 
 async function findNotionPageByYousignId(yousignId) {
@@ -227,7 +284,7 @@ async function createNotionPageFromYousign(event, status, withSignatureDate = fa
   const title = getYousignTitle(event, yousignId);
 
   const properties = {
-    "Nom": {
+    Nom: {
       title: [
         {
           text: {
@@ -260,6 +317,7 @@ async function createNotionPageFromYousign(event, status, withSignatureDate = fa
 async function updateGlobalStatus(pageId, status, withSignatureDate = false, event = null) {
   const properties = {
     "Statut signataire": selectProperty(status),
+    ...buildSignerIdUpdateProperties(event || {}),
   };
 
   if (withSignatureDate) {
@@ -276,37 +334,18 @@ async function updateGlobalStatus(pageId, status, withSignatureDate = false, eve
 
 async function updateSignerStatus(page, event) {
   const pageId = page.id;
+  const signerId = getCurrentSignerId(event);
   const signedAt = getSignatureDate(event);
-  const stageIndex = getSignerStageIndex(event);
 
-  let roleIndex = null;
+  let roleIndex = findRoleIndexBySignerIdInPage(page, signerId);
 
-  if (stageIndex === 1) {
-    roleIndex = 0;
-  } else if (stageIndex === 2) {
-    roleIndex = 1;
-  } else if (stageIndex === 3) {
-    const client1Status = getTextFromPage(page, "Client 1");
-    const client2Status = getTextFromPage(page, "Client 2");
-
-    if (client1Status === "Signé" && client2Status !== "Signé") {
-      roleIndex = 3;
-    } else {
-      roleIndex = 2;
-    }
-  } else if (stageIndex === 4) {
-    roleIndex = 3;
-  }
-
-  if (roleIndex === null) {
-    roleIndex = ROLES.findIndex((role) => {
-      const currentStatus = getTextFromPage(page, role.statusColumn);
-      return currentStatus !== "Signé" && currentStatus !== "Non concerné";
-    });
+  if (roleIndex === -1) {
+    roleIndex = findRoleIndexBySignerIdInEvent(event, signerId);
   }
 
   if (roleIndex < 0 || roleIndex >= ROLES.length) {
-    throw new Error("Impossible d'identifier le signataire à mettre à jour.");
+    console.log("Signataire non identifié clairement, aucune colonne modifiée.");
+    return null;
   }
 
   const role = ROLES[roleIndex];
@@ -314,6 +353,7 @@ async function updateSignerStatus(page, event) {
   await notion.pages.update({
     page_id: pageId,
     properties: {
+      ...buildSignerIdUpdateProperties(event),
       [role.statusColumn]: selectProperty("Signé"),
       [role.dateColumn]: dateProperty(signedAt),
     },
@@ -365,11 +405,17 @@ app.post("/webhook/yousign", async (req, res) => {
       const existingPage = await findNotionPageByYousignId(yousignId);
 
       if (existingPage) {
-        await updateGlobalStatus(existingPage.id, "En cours", false);
+        await notion.pages.update({
+          page_id: existingPage.id,
+          properties: {
+            "Statut signataire": selectProperty("En cours"),
+            ...buildSignerIdUpdateProperties(event),
+          },
+        });
 
         return res.status(200).json({
           success: true,
-          message: "Ligne Notion déjà existante, statut global mis à jour en En cours",
+          message: "Ligne Notion déjà existante, IDs signataires enregistrés",
           yousignId,
         });
       }
@@ -378,7 +424,7 @@ app.post("/webhook/yousign", async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: "Ligne Notion créée avec signataires en attente",
+        message: "Ligne Notion créée avec IDs signataires",
         yousignId,
       });
     }
@@ -391,6 +437,14 @@ app.post("/webhook/yousign", async (req, res) => {
       }
 
       const updatedRole = await updateSignerStatus(existingPage, event);
+
+      if (!updatedRole) {
+        return res.status(200).json({
+          success: true,
+          message: "Signataire non identifié, aucune colonne modifiée",
+          yousignId,
+        });
+      }
 
       return res.status(200).json({
         success: true,
