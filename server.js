@@ -76,7 +76,7 @@ function getSignatureRequest(event) {
 }
 
 function getSigner(event) {
-  return event.data?.signer || event.signer || event.data || {};
+  return event.data?.signer || event.signer || {};
 }
 
 function getSigners(event) {
@@ -119,11 +119,28 @@ function getYousignTitle(event, yousignId) {
   );
 }
 
+function normalizeDate(value) {
+  if (!value) return null;
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date.toISOString();
+}
+
 function getSignatureDate(event) {
+  const signer = getSigner(event);
+  const signatureRequest = getSignatureRequest(event);
+
   return (
-    event.event_time ||
-    event.created_at ||
-    event.data?.created_at ||
+    normalizeDate(signer.signed_at) ||
+    normalizeDate(signatureRequest.completed_at) ||
+    normalizeDate(signatureRequest.activated_at) ||
+    normalizeDate(event.data?.created_at) ||
+    normalizeDate(event.created_at) ||
     new Date().toISOString()
   );
 }
