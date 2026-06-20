@@ -12,6 +12,25 @@ const notion = new Client({
 
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
 
+const ROLES = [
+  {
+    statusColumn: "Respo P&Q",
+    dateColumn: "Date signature Respo P&Q",
+  },
+  {
+    statusColumn: "Présidente",
+    dateColumn: "Date signature Présidente",
+  },
+  {
+    statusColumn: "Client 1",
+    dateColumn: "Date signature Client 1",
+  },
+  {
+    statusColumn: "Client 2",
+    dateColumn: "Date signature Client 2",
+  },
+];
+
 async function getDataSourceId() {
   const database = await notion.databases.retrieve({
     database_id: NOTION_DATABASE_ID,
@@ -20,17 +39,73 @@ async function getDataSourceId() {
   return database.data_sources[0].id;
 }
 
+function textProperty(content) {
+  return {
+    rich_text: [
+      {
+        text: {
+          content,
+        },
+      },
+    ],
+  };
+}
+
+function selectProperty(name) {
+  return {
+    select: {
+      name,
+    },
+  };
+}
+
+function dateProperty(date) {
+  return {
+    date: {
+      start: date,
+    },
+  };
+}
+
 function getEventName(event) {
   return event.event_name || event.event || event.type;
 }
 
 function getSignatureRequest(event) {
-  return event.data?.signature_request || event.data || {};
+  return event.data?.signature_request || event.signature_request || {};
 }
 
-function getYousignId(event) {
+function getSigner(event) {
+  return event.data?.signer || event.signer || event.data || {};
+}
+
+function getSigners(event) {
   const signatureRequest = getSignatureRequest(event);
-  return signatureRequest.id || event.data?.id;
+
+  return (
+    signatureRequest.signers ||
+    event.data?.signers ||
+    event.signers ||
+    []
+  );
+}
+
+function getRequestId(event) {
+  const eventName = getEventName(event);
+  const signatureRequest = getSignatureRequest(event);
+  const signer = getSigner(event);
+
+  if (eventName && eventName.startsWith("signer.")) {
+    return (
+      signatureRequest.id ||
+      event.data?.signature_request_id ||
+      signer.signature_request_id ||
+      signer.signature_request?.id ||
+      null
+    );
+  }
+
+  return signatureRequest.id || event.data?.id || null;
 }
 
 function getYousignTitle(event, yousignId) {
@@ -40,27 +115,77 @@ function getYousignTitle(event, yousignId) {
     signatureRequest.name ||
     signatureRequest.title ||
     signatureRequest.external_id ||
-    `Demande Yousign ${yousignId.slice(0, 8)}`
+    `Demande Yousign ${String(yousignId).slice(0, 8)}`
   );
 }
 
-function getFirstSignerEmail(event) {
-  const signatureRequest = getSignatureRequest(event);
-
-  const signers =
-    signatureRequest.signers ||
-    event.data?.signers ||
-    event.data?.signature_request?.signers ||
-    [];
-
-  const firstSigner = signers[0];
-
+function getSignatureDate(event) {
   return (
-    firstSigner?.email ||
-    firstSigner?.info?.email ||
-    firstSigner?.contact?.email ||
-    null
+    event.event_time ||
+    event.created_at ||
+    event.data?.created_at ||
+    new Date().toISOString()
   );
+}
+
+function getTextFromPage(page, propertyName) {
+  const property = page.properties?.[propertyName];
+
+  if (!property) return "";
+
+  if (property.type === "rich_text") {
+    return property.rich_text.map((item) => item.plain_text).join("");
+  }
+
+  if (property.type === "title") {
+    return property.title.map((item) => item.plain_text).join("");
+  }
+
+  if (property.type === "select") {
+    return property.select?.name || "";
+  }
+
+  return "";
+}
+
+function getSignerStageIndex(event) {
+  const signer = getSigner(event);
+
+  const value =
+    signer.recipient_stage_index ??
+    signer.recipientStageIndex ??
+    signer.stage_index ??
+    signer.order ??
+    signer.position ??
+    event.data?.recipient_stage_index;
+
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  return Number(value);
+}
+
+function buildInitialSignerProperties(event, status, withDates = false) {
+  const signers = getSigners(event);
+  const signerCount = signers.length || 3;
+  const signedAt = getSignatureDate(event);
+
+  const properties = {};
+
+  ROLES.forEach((role, index) => {
+    if (index < signerCount) {
+      properties[role.statusColumn] = selectProperty(status);
+
+      if (withDates) {
+        properties[role.dateColumn] = dateProperty(signedAt);
+      }
+    } else {
+      properties[role.statusColumn] = selectProperty("Non concerné");
+    }
+  });
+
+  return properties;
 }
 
 async function findNotionPageByYousignId(yousignId) {
@@ -81,9 +206,8 @@ async function findNotionPageByYousignId(yousignId) {
 
 async function createNotionPageFromYousign(event, status, withSignatureDate = false) {
   const dataSourceId = await getDataSourceId();
-  const yousignId = getYousignId(event);
+  const yousignId = getRequestId(event);
   const title = getYousignTitle(event, yousignId);
-  const email = getFirstSignerEmail(event);
 
   const properties = {
     "Nom": {
@@ -95,34 +219,17 @@ async function createNotionPageFromYousign(event, status, withSignatureDate = fa
         },
       ],
     },
-    "Yousign ID": {
-      rich_text: [
-        {
-          text: {
-            content: yousignId,
-          },
-        },
-      ],
-    },
-    "Statut signataire": {
-      select: {
-        name: status,
-      },
-    },
+    "Yousign ID": textProperty(yousignId),
+    "Statut signataire": selectProperty(status),
+    ...buildInitialSignerProperties(
+      event,
+      status === "Signé" ? "Signé" : "En attente",
+      withSignatureDate
+    ),
   };
 
-  if (email) {
-    properties["E-mail"] = {
-      email: email,
-    };
-  }
-
   if (withSignatureDate) {
-    properties["Date de signature"] = {
-      date: {
-        start: new Date().toISOString(),
-      },
-    };
+    properties["Date de signature"] = dateProperty(getSignatureDate(event));
   }
 
   return await notion.pages.create({
@@ -133,27 +240,69 @@ async function createNotionPageFromYousign(event, status, withSignatureDate = fa
   });
 }
 
-async function updateNotionPage(pageId, status, withSignatureDate = false) {
+async function updateGlobalStatus(pageId, status, withSignatureDate = false, event = null) {
   const properties = {
-    "Statut signataire": {
-      select: {
-        name: status,
-      },
-    },
+    "Statut signataire": selectProperty(status),
   };
 
   if (withSignatureDate) {
-    properties["Date de signature"] = {
-      date: {
-        start: new Date().toISOString(),
-      },
-    };
+    properties["Date de signature"] = dateProperty(
+      event ? getSignatureDate(event) : new Date().toISOString()
+    );
   }
 
   await notion.pages.update({
     page_id: pageId,
     properties,
   });
+}
+
+async function updateSignerStatus(page, event) {
+  const pageId = page.id;
+  const signedAt = getSignatureDate(event);
+  const stageIndex = getSignerStageIndex(event);
+
+  let roleIndex = null;
+
+  if (stageIndex === 1) {
+    roleIndex = 0;
+  } else if (stageIndex === 2) {
+    roleIndex = 1;
+  } else if (stageIndex === 3) {
+    const client1Status = getTextFromPage(page, "Client 1");
+    const client2Status = getTextFromPage(page, "Client 2");
+
+    if (client1Status === "Signé" && client2Status !== "Signé") {
+      roleIndex = 3;
+    } else {
+      roleIndex = 2;
+    }
+  } else if (stageIndex === 4) {
+    roleIndex = 3;
+  }
+
+  if (roleIndex === null) {
+    roleIndex = ROLES.findIndex((role) => {
+      const currentStatus = getTextFromPage(page, role.statusColumn);
+      return currentStatus !== "Signé" && currentStatus !== "Non concerné";
+    });
+  }
+
+  if (roleIndex < 0 || roleIndex >= ROLES.length) {
+    throw new Error("Impossible d'identifier le signataire à mettre à jour.");
+  }
+
+  const role = ROLES[roleIndex];
+
+  await notion.pages.update({
+    page_id: pageId,
+    properties: {
+      [role.statusColumn]: selectProperty("Signé"),
+      [role.dateColumn]: dateProperty(signedAt),
+    },
+  });
+
+  return role.statusColumn;
 }
 
 app.get("/", (req, res) => {
@@ -186,7 +335,7 @@ app.post("/webhook/yousign", async (req, res) => {
 
     const event = req.body;
     const eventName = getEventName(event);
-    const yousignId = getYousignId(event);
+    const yousignId = getRequestId(event);
 
     if (!yousignId) {
       return res.status(400).json({
@@ -199,11 +348,11 @@ app.post("/webhook/yousign", async (req, res) => {
       const existingPage = await findNotionPageByYousignId(yousignId);
 
       if (existingPage) {
-        await updateNotionPage(existingPage.id, "En cours", false);
+        await updateGlobalStatus(existingPage.id, "En cours", false);
 
         return res.status(200).json({
           success: true,
-          message: "Ligne Notion déjà existante, statut mis à jour en En cours",
+          message: "Ligne Notion déjà existante, statut global mis à jour en En cours",
           yousignId,
         });
       }
@@ -212,7 +361,23 @@ app.post("/webhook/yousign", async (req, res) => {
 
       return res.status(200).json({
         success: true,
-        message: "Ligne Notion créée",
+        message: "Ligne Notion créée avec signataires en attente",
+        yousignId,
+      });
+    }
+
+    if (eventName === "signer.done") {
+      let existingPage = await findNotionPageByYousignId(yousignId);
+
+      if (!existingPage) {
+        existingPage = await createNotionPageFromYousign(event, "En cours", false);
+      }
+
+      const updatedRole = await updateSignerStatus(existingPage, event);
+
+      return res.status(200).json({
+        success: true,
+        message: `${updatedRole} mis à jour en Signé`,
         yousignId,
       });
     }
@@ -221,11 +386,11 @@ app.post("/webhook/yousign", async (req, res) => {
       const existingPage = await findNotionPageByYousignId(yousignId);
 
       if (existingPage) {
-        await updateNotionPage(existingPage.id, "Signé", true);
+        await updateGlobalStatus(existingPage.id, "Signé", true, event);
 
         return res.status(200).json({
           success: true,
-          message: "Notion mis à jour en Signé",
+          message: "Statut global Notion mis à jour en Signé",
           yousignId,
         });
       }
