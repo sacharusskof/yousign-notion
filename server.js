@@ -440,6 +440,45 @@ async function updateSignerStatus(page, event) {
 
   return role.statusColumn;
 }
+function getRequestFinalStatus(eventName) {
+  const statuses = {
+    "signature_request.declined": "Refusé",
+    "signature_request.expired": "Expiré",
+    "signature_request.canceled": "Annulé",
+    "signature_request.cancelled": "Annulé",
+  };
+
+  return statuses[eventName] || null;
+}
+
+async function updateSignerDeclined(page, event) {
+  const pageId = page.id;
+  const signerId = getCurrentSignerId(event);
+
+  let roleIndex = findRoleIndexBySignerIdInPage(page, signerId);
+
+  if (roleIndex === -1) {
+    roleIndex = findRoleIndexBySignerIdInEvent(event, signerId);
+  }
+
+  if (roleIndex < 0 || roleIndex >= ROLES.length) {
+    console.log("Signataire refusé non identifié clairement.");
+    return null;
+  }
+
+  const role = ROLES[roleIndex];
+
+  await notion.pages.update({
+    page_id: pageId,
+    properties: {
+      "Statut signataire": selectProperty("Refusé"),
+      ...buildSignerIdUpdateProperties(event),
+      [role.statusColumn]: selectProperty("Refusé"),
+    },
+  });
+
+  return role.statusColumn;
+}
 
 async function createPageOnlyIfStudyExists(event, status, withSignatureDate = false) {
   const yousignId = getRequestId(event);
@@ -505,7 +544,75 @@ app.post("/webhook/yousign", async (req, res) => {
         error: "Aucun Yousign ID trouvé dans le webhook.",
       });
     }
+    if (eventName === "signer.declined") {
+      let existingPage = await findNotionPageByYousignId(yousignId);
 
+      if (!existingPage) {
+        existingPage = await createPageOnlyIfStudyExists(
+          event,
+          "Refusé",
+          false
+        );
+      }
+
+      if (!existingPage) {
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+          message: "Demande refusée ignorée : aucune étude correspondante.",
+          yousignId,
+        });
+      }
+
+      const updatedRole = await updateSignerDeclined(existingPage, event);
+
+      if (!updatedRole) {
+        await updateGlobalStatus(existingPage.id, "Refusé", false, event);
+
+        return res.status(200).json({
+          success: true,
+          message: "Demande marquée Refusé, signataire non identifié",
+          yousignId,
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: `${updatedRole} mis à jour en Refusé`,
+        yousignId,
+      });
+    }
+
+    const requestFinalStatus = getRequestFinalStatus(eventName);
+
+    if (requestFinalStatus) {
+      let existingPage = await findNotionPageByYousignId(yousignId);
+
+      if (!existingPage) {
+        existingPage = await createPageOnlyIfStudyExists(
+          event,
+          requestFinalStatus,
+          false
+        );
+      }
+
+      if (!existingPage) {
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+          message: `Demande ${requestFinalStatus} ignorée : aucune étude correspondante.`,
+          yousignId,
+        });
+      }
+
+      await updateGlobalStatus(existingPage.id, requestFinalStatus, false, event);
+
+      return res.status(200).json({
+        success: true,
+        message: `Statut global Notion mis à jour en ${requestFinalStatus}`,
+        yousignId,
+      });
+    }
     if (eventName === "signature_request.activated") {
       const { studyReference, studyPage } = await findStudyForYousignEvent(
         event,
